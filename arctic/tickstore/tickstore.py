@@ -598,59 +598,57 @@ class TickStore(object):
         logger.debug("%d buckets in %s: approx %s ticks/sec" % (len(buckets), t, rate))
 
     def _update_last_written_document(self, data, symbol, pandas):
-        # First get the last written document for the symbol.
-        #
         last_written_document = self._collection.find_one({SYMBOL: symbol}, sort=[(START, pymongo.DESCENDING)])
         if last_written_document is None:
             logger.info("DEBUG: No document found for symbol %s" % symbol)
             return 0
 
-        # If it doesn't exist, return.
-        # Else, reliably check if the number of rows is less then the chunk size.
-        #
         if last_written_document[COUNT] >= self._chunk_size:
             logger.info("DEBUG: Document has already reached max chunck size")
             return 0
 
-        # If it isn't, return.
-        # Else, decompress the document, append the required data, compress, update.
-        #
+        # As the last written document for the symbol has not reached its _chunk_size, append more data to it.
+        # Start by decompressing the document to get the data and index.
         column_set = set()
         column_dtypes = {}
         last_written_data = self._read_bucket(last_written_document, column_set, column_dtypes,
                                               include_symbol=False, include_images=False, columns=None)
 
+        # Data transformation required by _pad_and_fix_dtypes.
         for k, v in last_written_data.iteritems():
             last_written_data[k] = [v]
         last_written_data = self._pad_and_fix_dtypes(last_written_data, column_dtypes)
+
+        # Recompute the index and clean the original data afterwards.
         last_index = pd.to_datetime(np.concatenate(last_written_data[INDEX]), utc=True, unit='ms')
         del last_written_data[INDEX]
 
+        # Next step is to combine the last written data with the data to be written so that a full chunk is filled.
         if pandas:
             logger.info("DEBUG: Cannot compact on pd.DataFrame, just list")
             return 0
         else:
-            # Need to transform from dict of lists to list of dicts
+            # Another data transformation required by TickStore._to_bucket.
             data_to_update = []
             for idx, index_date in enumerate(last_index):
                 data_for_index_date = {'index': index_date}
                 data_for_index_date.update({sym: sym_values[0][idx] for sym, sym_values in last_written_data.iteritems()})
                 data_to_update.append(data_for_index_date)
 
-            # Work out how many rows from the input data we can append to the last written document
+            # Work out how many rows from the input data can be appended to the last written document.
             rows_to_append = self._chunk_size - len(data_to_update)
             data_to_update.extend(data[:rows_to_append])
 
-            # Convert the data to a bucket that we can write to mongo
+            # Compress the combined data so that is is ready for writing.
             bucket_to_update, _ = TickStore._to_bucket(data_to_update, symbol, initial_image=None)
 
         # TODO: How to handle timezones in the Index? The last data has a UTC index, but data passed might have an index
         # with not timezone or different timezone. Probably should just localize to UTC.
         update_dict = {
-            END: bucket_to_update[END],  # type: datetime.datetime
-            COUNT: bucket_to_update[COUNT],  # type: int
-            INDEX: bucket_to_update[INDEX],  # type: Binary
-            COLUMNS: bucket_to_update[COLUMNS]  # type: Binary
+            END: bucket_to_update[END],
+            COUNT: bucket_to_update[COUNT],
+            INDEX: bucket_to_update[INDEX],
+            COLUMNS: bucket_to_update[COLUMNS]
         }
         update_result = self._collection.update_one({'_id': last_written_document['_id']}, {"$set": update_dict})
 
@@ -661,7 +659,6 @@ class TickStore(object):
                 update_result.modified_count
             ))
 
-        # Finally, need to return the rows written (maybe the next index to be written).
         return rows_to_append
 
     def _pandas_to_buckets(self, x, symbol, initial_image):
