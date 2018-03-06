@@ -537,7 +537,7 @@ class TickStore(object):
                 raise OverlappingDataException("Document already exists with start:{} end:{} in the range of our start:{} end:{}".format(
                                                             doc[START], doc[END], start, end))
 
-    def write(self, symbol, data, initial_image=None, metadata=None):
+    def write(self, symbol, data, initial_image=None, metadata=None, compact=False):
         """
         Writes a list of market data events.
 
@@ -555,6 +555,9 @@ class TickStore(object):
             assumed to be the time of the timestamp of the index
         metadata: dict
             optional user defined metadata - one per symbol
+        compact: bool
+            optional flag to specify whether compacting is desired. This attempts to first update the last written
+            document until the chunck_size is achieved before creating any new documents
         """
         pandas = False
         # Check for overlapping data
@@ -569,11 +572,17 @@ class TickStore(object):
             raise UnhandledDtypeException("Can't persist type %s to tickstore" % type(data))
         self._assert_nonoverlapping_data(symbol, to_dt(start), to_dt(end))
 
+        rows_written = 0
+        if compact:
+            rows_written = self._update_last_written_document(data, symbol, pandas)
+
         if pandas:
-            buckets = self._pandas_to_buckets(data, symbol, initial_image)
+            buckets = self._pandas_to_buckets(data.iloc[rows_written:], symbol, initial_image)
         else:
-            buckets = self._to_buckets(data, symbol, initial_image)
-        self._write(buckets)
+            buckets = self._to_buckets(data[rows_written:], symbol, initial_image)
+
+        if len(buckets) > 0:
+            self._write(buckets)
 
         if metadata:
             ret = self._metadata.replace_one({SYMBOL: symbol},
@@ -587,6 +596,73 @@ class TickStore(object):
         ticks = len(buckets) * self._chunk_size
         rate = int(ticks / t) if t != 0 else float("nan")
         logger.debug("%d buckets in %s: approx %s ticks/sec" % (len(buckets), t, rate))
+
+    def _update_last_written_document(self, data, symbol, pandas):
+        # First get the last written document for the symbol.
+        #
+        last_written_document = self._collection.find_one({SYMBOL: symbol}, sort=[(START, pymongo.DESCENDING)])
+        if last_written_document is None:
+            logger.info("DEBUG: No document found for symbol %s" % symbol)
+            return 0
+
+        # If it doesn't exist, return.
+        # Else, reliably check if the number of rows is less then the chunk size.
+        #
+        if last_written_document[COUNT] >= self._chunk_size:
+            logger.info("DEBUG: Document has already reached max chunck size")
+            return 0
+
+        # If it isn't, return.
+        # Else, decompress the document, append the required data, compress, update.
+        #
+        column_set = set()
+        column_dtypes = {}
+        last_written_data = self._read_bucket(last_written_document, column_set, column_dtypes,
+                                              include_symbol=False, include_images=False, columns=None)
+
+        for k, v in last_written_data.iteritems():
+            last_written_data[k] = [v]
+        last_written_data = self._pad_and_fix_dtypes(last_written_data, column_dtypes)
+        last_index = pd.to_datetime(np.concatenate(last_written_data[INDEX]), utc=True, unit='ms')
+        del last_written_data[INDEX]
+
+        if pandas:
+            logger.info("DEBUG: Cannot compact on pd.DataFrame, just list")
+            return 0
+        else:
+            # Need to transform from dict of lists to list of dicts
+            data_to_update = []
+            for idx, index_date in enumerate(last_index):
+                data_for_index_date = {'index': index_date}
+                data_for_index_date.update({sym: sym_values[0][idx] for sym, sym_values in last_written_data.iteritems()})
+                data_to_update.append(data_for_index_date)
+
+            # Work out how many rows from the input data we can append to the last written document
+            rows_to_append = self._chunk_size - len(data_to_update)
+            data_to_update.extend(data[:rows_to_append])
+
+            # Convert the data to a bucket that we can write to mongo
+            bucket_to_update, _ = TickStore._to_bucket(data_to_update, symbol, initial_image=None)
+
+        # TODO: How to handle timezones in the Index? The last data has a UTC index, but data passed might have an index
+        # with not timezone or different timezone. Probably should just localize to UTC.
+        update_dict = {
+            END: bucket_to_update[END],  # type: datetime.datetime
+            COUNT: bucket_to_update[COUNT],  # type: int
+            INDEX: bucket_to_update[INDEX],  # type: Binary
+            COLUMNS: bucket_to_update[COLUMNS]  # type: Binary
+        }
+        update_result = self._collection.update_one({'_id': last_written_document['_id']}, {"$set": update_dict})
+
+        if update_result.matched_count != 1 or update_result.modified_count != 1:
+            logger.error("Expected to update precisely one document: %s, but matched %s and modified %s" % (
+                last_written_document['_id'],
+                update_result.matched_count,
+                update_result.modified_count
+            ))
+
+        # Finally, need to return the rows written (maybe the next index to be written).
+        return rows_to_append
 
     def _pandas_to_buckets(self, x, symbol, initial_image):
         rtn = []
